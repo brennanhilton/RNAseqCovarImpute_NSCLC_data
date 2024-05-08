@@ -1,0 +1,711 @@
+---
+title: "Untitled"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+Install from github
+```{r}
+library(devtools)
+install_github("brennanhilton/RNAseqCovarImpute")
+```
+
+
+```{r}
+library(tidyverse)
+library(Amelia)
+library(mice)
+library(edgeR)
+library(doParallel)
+library(foreach)
+library(RNAseqCovarImpute)
+library(doRNG)
+library(BiocParallel)
+```
+
+Data processing
+Data come from EMBL-EBI: E-GEOD-81089. I renamed the experiment-design.tsv file as "covariates.tsv" and the raw-counts file as "raw-counts.tsv"
+```{r}
+data <- read_tsv("./covariates.tsv") %>% janitor::clean_names()
+colnames(data) <- gsub("^sample_characteristic_", "", colnames(data))
+data <- data %>% dplyr::select(run, sex, age, clinical_information, sampling_site)
+data$age <- gsub(" year", "", data$age)
+data <- data %>%
+  mutate(age = as.numeric(age)) %>%
+  dplyr::rename(smoking = clinical_information)
+
+counts <- read_tsv("./raw-counts.tsv") %>%
+  dplyr::rename(
+    "ENSEMBL" = "Gene ID",
+    "SYMBOL" = "Gene Name"
+  )
+annot <- counts %>% dplyr::select(ENSEMBL, SYMBOL)
+counts <- counts %>% dplyr::select(-ENSEMBL, -SYMBOL)
+rownames(counts) <- annot$ENSEMBL
+counts <- as.matrix(counts)
+# Make sure we only include counts corresponding to the runs in the covariate data
+counts <- counts[, data$run]
+ncol(counts)
+# below 0 result indicates that the order of samples match between covariate data and count data
+data %>%
+  mutate(hmm = colnames(counts) == run) %>%
+  filter(run == FALSE)
+
+data <- data %>% mutate(sex = as.factor(sex), smoking = as.factor(smoking), sampling_site = as.factor(sampling_site))
+summary(data)
+
+# Store counts in DGE list
+alldg <- DGEList(counts, genes = annot)
+
+# Calculate the minimum library size in millions
+min_lib_size <- min(alldg$samples$lib.size) / 1000000
+# Filtering cutoff of approximately 10 counts per gene, on the cpm scale
+cpm_cutoff <- 10 / min_lib_size
+# Filter to keep genes with an average CPM across all samples above this cutoff
+keep <- rowMeans(cpm(alldg)) > cpm_cutoff
+alldg <- alldg[keep, , keep.lib.sizes = FALSE]
+nrow(alldg)
+# norm factors used by voom to normalize library sizes using TMM method
+alldg <- calcNormFactors(alldg)
+dim(alldg)
+
+data <- data %>% dplyr::select(-run)
+```
+
+Get true positives from the full data model
+```{r}
+design <- model.matrix(~ sex + age + smoking, data)
+
+vout <- limma::voom(alldg, design = design)
+lout <- limma::lmFit(vout)
+coefhat <- coef(lout)[, -1, drop = FALSE]
+eout <- eBayes(lout)
+
+top.table1 <- topTable(eout, coef = "sexmale", sort.by = "P", n = Inf) %>%
+  mutate(significant = ifelse(adj.P.Val < 0.05, "Yes", "No"))
+
+truth_res <- tibble(
+  ENSEMBL = top.table1$ENSEMBL,
+  coef_verify = top.table1$logFC,
+  significant = top.table1$significant
+) %>%
+  mutate(null = significant == "No") %>%
+  dplyr::rename(probe = ENSEMBL)
+write_csv(truth_res, "truth_res_cancer_data_sex_age_smoking.csv")
+
+# number of DEGs (these are defined as true positives)
+truth_res %>%
+  group_by(significant) %>%
+  summarize(n = n())
+```
+
+Set up missing patterns
+```{r}
+adj_formula <- "~sex + age + smoking"
+
+# setup missing data patterns
+pattern_vars <- expand.grid(0:1, 0:1)
+# then add back the predictor of interest, which is never amputed, so the first col =1 the whole way down
+pattern2 <- matrix(1, nrow = nrow(pattern_vars), ncol = 1)
+pattern1 <- cbind(pattern2, pattern_vars)
+# remove last row which is all 1s (all 1s means no missingness induced)
+pattern1 <- pattern1[1:nrow(pattern1) - 1, ]
+# for MNAR, variables that will be observed are weighted with 0, such that all the missingness depends on data that are also missing. For MNAR, we can add the data on individual and set it to 0 to indicate that it should be missing.
+pattern3 <- matrix(0, nrow = nrow(pattern1), ncol = 1)
+pattern1_mnar <- cbind(pattern1, pattern3)
+
+mnar_weights <- cbind(matrix(0, nrow = 3, ncol = 3), matrix(1, nrow = 3))
+result <- ampute(data = data, prop = 55, mech = "MNAR", patterns = pattern1_mnar, weights = mnar_weights)
+ampute_i <- result$amp
+check <- ampute_i %>% mutate(original_sampling_site = data$sampling_site)
+check %>%
+  group_by(sampling_site) %>%
+  summarise(n = n())
+check %>%
+  group_by(original_sampling_site) %>%
+  summarise(n = n())
+check %>%
+  drop_na() %>%
+  group_by(original_sampling_site) %>%
+  summarise(n = n())
+# you can see that we lose a lot of data for sampling site = tumor but retain more data for sampling site = non-malignant. So missingness depends on this variable. In the below analysis we will drop this variable from the imputation process, so that we are analyzing data where we lack a variable that accounts for the missingness (MNAR). For MAR, the imputation methods will have access to the sampling site data. For MCAR, it does not matter, because missingness is completely random and will not depend on sampling site.
+```
+
+Run PCA for RNAseqCovarImpute
+```{r}
+library(PCAtools)
+# for PCAtools variables are expected to be in the rows and samples in the columns by default.
+pca_data <- vout$E
+
+horn <- parallelPCA(pca_data)
+
+p <- pca(pca_data)
+
+horn$n
+# For horn we extract 56 PCs
+pcs <- p$rotated[, 1:horn$n]
+saveRDS(pcs, "pcs_cancer.RDS")
+saveRDS(data, "data_cancer.RDS")
+saveRDS(alldg, "alldg_cancer.RDS")
+
+
+var_80 <- which(cumsum(p$variance) > 80)[1]
+# If we want to use the 80% variance method, we extract 47 PCs
+pcs <- p$rotated[, 1:var_80]
+saveRDS(pcs, "pcs_cancer_80.RDS")
+```
+
+Simulation study below. If all files are saved above, you can close out and restart here to free up R environment.
+```{r}
+library(tidyverse)
+library(Amelia)
+library(mice)
+library(edgeR)
+library(doParallel)
+library(foreach)
+library(RNAseqCovarImpute)
+library(doRNG)
+library(BiocParallel)
+data <- readRDS("data_cancer.RDS")
+mat <- readRDS("alldg_cancer.RDS")
+alldg <- readRDS("alldg_cancer.RDS")
+pcs_horn <- readRDS("pcs_cancer.RDS")
+pcs_80 <- readRDS("pcs_cancer_80.RDS")
+truth_res <- read_csv("truth_res_cancer_data_sex_age_smoking.csv")
+
+adj_formula <- "~sex + age + smoking"
+
+# remake the missing patterns if you closed out.
+pattern_vars <- expand.grid(0:1, 0:1)
+# then add back the predictor of interest, which is never amputed, so the first col =1 the whole way down
+pattern2 <- matrix(1, nrow = nrow(pattern_vars), ncol = 1)
+pattern1 <- cbind(pattern2, pattern_vars)
+# remove last row which is all 1s (all 1s means no missingness induced)
+pattern1 <- pattern1[1:nrow(pattern1) - 1, ]
+# for MNAR, variables that will be observed are weighted with 0, such that all the missingness depends on data that are also missing. For MNAR, we can add the data on individual and set it to 0 to indicate that it should be missing.
+pattern3 <- matrix(0, nrow = nrow(pattern1), ncol = 1)
+pattern1_mnar <- cbind(pattern1, pattern3)
+
+# This function will simulate missingness given a missing mechanism and percent missing, and then run CC, SI, and RNAseqCovarImpute methods
+simulation2 <- function(data, mat, voom_formula, predictor, miss_mech, prop_miss, pattern, pcs) {
+  RNGkind("L'Ecuyer-CMRG")
+  mcoptions <- list(mc.set.seed = TRUE)
+  myCluster <- makeCluster(10, # number of cores to use
+    type = "PSOCK"
+  ) # type of cluster
+  registerDoParallel(myCluster)
+  set.seed(2023)
+  all_coef_se <- foreach(i = 1:10, .options.multicore = mcoptions) %dorng% {
+    library(tidyverse)
+    library(mice)
+    library(edgeR)
+    library(BiocStyle)
+    library(doParallel)
+    library(foreach)
+    library(RNAseqCovarImpute)
+    library(missForest)
+    library(BiocParallel)
+    truth_res <- read_csv("truth_res_cancer_data_sex_age_smoking.csv") 
+    # convenient to save the true results along with the different methods
+    mnar_weights <- cbind(matrix(0, nrow = 3, ncol = 3), matrix(1, nrow = 3))
+    # Simulate missing data using mice ampute function
+    result <- ampute(data = data,
+                     prop = prop_miss,
+                     mech = miss_mech,
+                     patterns = pattern,
+                     weights = mnar_weights)
+    ampute_i <- result$amp
+
+    # ampute converts data to numeric for calculations of weights that influence pattern of missing data for MAR and MNAR mechanisms. But no weights if MCAR
+    # for MAR and MNAR, convert factors back to factors.
+    if (miss_mech != "MCAR") {
+      ampute_i <- ampute_i %>%
+        mutate(sex = ifelse(sex == 2, "male", "female")) %>%
+        mutate(
+          sex = as.factor(sex),
+          smoking = as.factor(smoking),
+          sampling_site = as.factor(sampling_site)
+        )
+    }
+    # MNAR doesn't get the extra data, but MAR and MCAR do.
+    if (miss_mech != "MNAR") {
+      ampute_i <- ampute_i %>% mutate(sampling_site = data$sampling_site)
+    }
+    # RNAseqCovarImpute gene bin looping method and saving results
+    intervals <- get_gene_bin_intervals(mat, ampute_i)
+    imputed_data_list <-
+      impute_by_gene_bin(data = ampute_i,
+                         intervals = intervals,
+                         DGE = mat,
+                         m = 10,
+                         BPPARAM = SerialParam())
+
+    coef_se <-
+      limmavoom_imputed_data_list(gene_intervals = intervals,
+                                  DGE = mat,
+                                  imputed_data_list = imputed_data_list,
+                                  m = 10,
+                                  voom_formula = voom_formula,
+                                  BPPARAM = SerialParam())
+    
+    # Create single imputation data with missForest
+    data_si <- ampute_i
+    data_si <- missForest(data_si)
+    data_si <- data_si$ximp
+    output2 <- list(coef_se, imputed_data_list, data_si)
+  }
+  # Rubins rules part of the RNAseqCovarImpute gene bin looping method to process all the coefs and SEs
+  rubins_res <- foreach(i = 1:10) %do% {
+    all_coef_se_i <- all_coef_se[[i]][[1]]
+    rubins_res <- combine_rubins(DGE = mat,
+                                 model_results = all_coef_se_i,
+                                 predictor = "sexmale")
+  }
+
+
+  # Saving the results for the RNAseqCovarImpute gene bin looping method
+  # By itself from the other methods because this method takes much longer
+  res_bin_method <- foreach(i = 1:as.numeric(length(rubins_res))) %do% {
+    # simulated missing data then imputation model
+    rubins_res_i <- rubins_res[[i]]
+    is_null_gene <- truth_res$significant == "No"
+    # add together with true model. join by ensembl
+    both_models <- truth_res %>%
+      dplyr::select(-significant) %>%
+      left_join(rubins_res_i) %>%
+      dplyr::rename(p_adj = combined_p_adj_bayes) %>%
+      mutate(significant = ifelse(p_adj < 0.05, "Yes", "No"))
+
+    # For calculating false postive rate and true positive rate
+    true_number <- both_models %>%
+      dplyr::filter(null == FALSE) %>%
+      nrow() %>%
+      as.numeric()
+    true_identified <- both_models %>%
+      dplyr::filter(null == FALSE) %>%
+      dplyr::filter(significant == "Yes") %>%
+      nrow() %>%
+      as.numeric()
+    false_pos <- both_models %>%
+      dplyr::filter(significant == "Yes") %>%
+      dplyr::filter(null == TRUE) %>%
+      nrow() %>%
+      as.numeric()
+    total_pos <- both_models %>%
+      dplyr::filter(significant == "Yes") %>%
+      nrow() %>%
+      as.numeric()
+
+    error_summary <- tibble(
+      prop_true_identifed = true_identified / true_number,# the TPR
+      false_pos_ratio = false_pos / total_pos # the FPR
+    ) %>%
+      mutate(
+        Method = "RNAseqCovarImpute",
+        Predictor = colnames(all_coef_se[[1]][[3]])[1]
+      )
+    # Save the coefs to calculate mean absolute percentage error later
+    coefs <- both_models %>% dplyr::select(probe, coef_combined, coef_verify)
+
+    output <- list(
+      error = error_summary,
+      coefs = coefs
+    )
+  }
+
+  savename1 <- paste0("./data/gene_bin_method_", miss_mech, "_", predictor, "_", as.character(prop_miss), "_cancer")
+
+  saveRDS(res_bin_method, savename1)
+
+  # Separate parallel loop for all other methods together
+  myCluster <- makeCluster(5, # number of cores to use
+    type = "PSOCK"
+  ) # type of cluster
+  registerDoParallel(myCluster)
+
+  all_other_methods <- foreach(i = 1:as.numeric(length(rubins_res))) %dopar% {
+    # new PCA MI method
+    library(tidyverse)
+    library(mice)
+    library(edgeR)
+    library(BiocStyle)
+    library(doParallel)
+    library(foreach)
+    library(RNAseqCovarImpute)
+    library(missForest)
+    library(BiocParallel)
+    truth_res <- read_csv("truth_res_cancer_data_sex_age_smoking.csv") 
+    # convenient to save the true results along with the different methods
+
+    # This is where I stored the simulated missing data when running the gene bin method below
+    ampute_i <- complete(all_coef_se[[i]][[2]][[1]], 0) %>%
+      dplyr::select(-starts_with("ENS"))
+    # Add the PCA data, number of PCs was determined by Horn's parallel analysis
+    ampute_pca <- cbind(ampute_i, pcs)
+    # Run MI PCA method
+    imp <- mice(ampute_pca, m = 10)
+    mi_pca_res <-
+      limmavoom_imputed_data_pca(imp = imp,
+                                 DGE = mat,
+                                 voom_formula = voom_formula,
+                                 BPPARAM = SerialParam()) %>%
+      arrange(sexmale_p) %>%
+      mutate(combined_p_adj = p.adjust(sexmale_p, method = "fdr")) %>%
+      mutate(significant = ifelse(combined_p_adj < 0.05, "Yes", "No")) %>%
+      dplyr::select(probe, sexmale_coef, significant)
+
+    both_models_pca <- truth_res %>%
+      dplyr::select(-significant) %>%
+      left_join(mi_pca_res)
+    coefs_pca <- mi_pca_res %>% dplyr::select(probe, sexmale_coef)
+
+    # For calculating false postive rate and true positive rate
+    true_number <- both_models_pca %>%
+      dplyr::filter(null == FALSE) %>%
+      nrow() %>%
+      as.numeric()
+    true_identified <- both_models_pca %>%
+      dplyr::filter(null == FALSE) %>%
+      dplyr::filter(significant == "Yes") %>%
+      nrow() %>%
+      as.numeric()
+    false_pos <- both_models_pca %>%
+      dplyr::filter(significant == "Yes") %>%
+      dplyr::filter(null == TRUE) %>%
+      nrow() %>%
+      as.numeric()
+    total_pos <- both_models_pca %>%
+      dplyr::filter(significant == "Yes") %>%
+      nrow() %>%
+      as.numeric()
+
+
+    error_summary_pca <- tibble(
+      prop_true_identifed = true_identified / true_number,
+      false_pos_ratio = false_pos / total_pos
+    ) %>%
+      mutate(
+        Method = "RNAseqCovarImpute PCA",
+        Predictor = colnames(all_coef_se[[1]][[3]])[1]
+      )
+
+    # Now complete case analysis. Drop NAs from the simulated missing data
+    ampute_i <- complete(all_coef_se[[i]][[2]][[1]], 0) %>%
+      dplyr::select(-starts_with("ENS")) %>%
+      mutate(pathways_id = colnames(mat)) %>%
+      drop_na()
+    # Run limma-voom
+    alldg_i <- mat[, ampute_i$pathways_id]
+    design1 <- model.matrix(as.formula(voom_formula), ampute_i)
+    fit1 <- eBayes(voomLmFit(alldg_i, design1))
+    top.table1 <- topTable(fit1, coef = "sexmale", sort.by = "P", n = Inf) %>%
+      dplyr::rename(probe = ENSEMBL)
+
+    both_models <- truth_res %>%
+      dplyr::select(-significant) %>%
+      left_join(top.table1) %>%
+      mutate(significant = ifelse(adj.P.Val < 0.05, "Yes", "No"))
+
+    # For calculating false postive rate and true positive rate
+    true_number <- both_models %>%
+      dplyr::filter(null == FALSE) %>%
+      nrow() %>%
+      as.numeric()
+    true_identified <- both_models %>%
+      dplyr::filter(null == FALSE) %>%
+      dplyr::filter(significant == "Yes") %>%
+      nrow() %>%
+      as.numeric()
+    false_pos <- both_models %>%
+      dplyr::filter(significant == "Yes") %>%
+      dplyr::filter(null == TRUE) %>%
+      nrow() %>%
+      as.numeric()
+    total_pos <- both_models %>%
+      dplyr::filter(significant == "Yes") %>%
+      nrow() %>%
+      as.numeric()
+
+    error_summary <- tibble(
+      prop_true_identifed = true_identified / true_number,
+      false_pos_ratio = false_pos / total_pos
+    ) %>%
+      mutate(
+        Method = "Complete case",
+        Predictor = colnames(all_coef_se[[1]][[3]])[1]
+      )
+
+
+
+    # Run single imputation method with random forest. Not sure why, but I ran the SI above, here we pull it out of the all_coef_se object
+    data_si <- all_coef_se[[i]][[3]] %>%
+      mutate(pathways_id = colnames(mat))
+    # Run limma-voom
+    alldg_si <- mat[, data_si$pathways_id]
+    design_si <- model.matrix(as.formula(voom_formula), data_si)
+    fit_si <- eBayes(voomLmFit(alldg_si, design_si))
+    top.table_si <- topTable(fit_si, coef = "sexmale", sort.by = "P", n = Inf) %>%
+      dplyr::rename(probe = ENSEMBL)
+
+    both_models_si <- truth_res %>%
+      dplyr::select(-significant) %>%
+      left_join(top.table_si) %>%
+      mutate(significant = ifelse(adj.P.Val < 0.05, "Yes", "No"))
+
+    # For calculating false postive rate and true positive rate
+    true_number <- both_models_si %>%
+      dplyr::filter(null == FALSE) %>%
+      nrow() %>%
+      as.numeric()
+    true_identified <- both_models_si %>%
+      dplyr::filter(null == FALSE) %>%
+      dplyr::filter(significant == "Yes") %>%
+      nrow() %>%
+      as.numeric()
+    false_pos <- both_models_si %>%
+      dplyr::filter(significant == "Yes") %>%
+      dplyr::filter(null == TRUE) %>%
+      nrow() %>%
+      as.numeric()
+    total_pos <- both_models_si %>%
+      dplyr::filter(significant == "Yes") %>%
+      nrow() %>%
+      as.numeric()
+
+    error_summary_si <- tibble(
+      prop_true_identifed = true_identified / true_number,
+      false_pos_ratio = false_pos / total_pos
+    ) %>%
+      mutate(
+        Method = "Single imputation",
+        Predictor = colnames(all_coef_se[[1]][[3]])[1]
+      )
+    coefs_si <- both_models_si %>%
+      dplyr::select(probe, logFC, coef_verify) %>%
+      dplyr::rename(
+        logFC_si = logFC,
+        coef_verify_si = coef_verify
+      )
+
+    # Save the coefs to calculate mean absolute percentage error later
+    coefs <- both_models %>%
+      dplyr::select(probe, logFC, coef_verify) %>%
+      left_join(coefs_si) %>%
+      left_join(coefs_pca)
+
+    output <- list(
+      error = error_summary,
+      error_si = error_summary_si,
+      coefs = coefs,
+      error_pca = error_summary_pca
+    )
+  }
+
+
+
+
+
+  savename2 <- paste0("./data/all_other_methods_", miss_mech, "_", predictor, "_", as.character(prop_miss), "_cancer")
+  saveRDS(all_other_methods, savename2)
+}
+
+
+# Using the function defined above, we run all the methods at different levels of missing data and under different missing data mechanisms
+time1 <- Sys.time()
+simulation2(data = data, mat = alldg, voom_formula = adj_formula, predictor = "sexmale", miss_mech = "MCAR", prop_miss = 55, pattern = pattern1_mnar, pcs = pcs_horn)
+simulation2(data = data, mat = alldg, voom_formula = adj_formula, predictor = "sexmale", miss_mech = "MAR", prop_miss = 55, pattern = pattern1_mnar, pcs = pcs_horn)
+simulation2(data = data, mat = alldg, voom_formula = adj_formula, predictor = "sexmale", miss_mech = "MNAR", prop_miss = 55, pattern = pattern1_mnar, pcs = pcs_horn)
+time2 <- Sys.time()
+print(time2 - time1)
+simulation2(data = data, mat = alldg, voom_formula = adj_formula, predictor = "sexmale", miss_mech = "MCAR", prop_miss = 65, pattern = pattern1_mnar, pcs = pcs_horn)
+simulation2(data = data, mat = alldg, voom_formula = adj_formula, predictor = "sexmale", miss_mech = "MAR", prop_miss = 65, pattern = pattern1_mnar, pcs = pcs_horn)
+simulation2(data = data, mat = alldg, voom_formula = adj_formula, predictor = "sexmale", miss_mech = "MNAR", prop_miss = 65, pattern = pattern1_mnar, pcs = pcs_horn)
+
+simulation2(data = data, mat = alldg, voom_formula = adj_formula, predictor = "sexmale", miss_mech = "MCAR", prop_miss = 75, pattern = pattern1_mnar, pcs = pcs_horn)
+simulation2(data = data, mat = alldg, voom_formula = adj_formula, predictor = "sexmale", miss_mech = "MAR", prop_miss = 75, pattern = pattern1_mnar, pcs = pcs_horn)
+simulation2(data = data, mat = alldg, voom_formula = adj_formula, predictor = "sexmale", miss_mech = "MNAR", prop_miss = 75, pattern = pattern1_mnar, pcs = pcs_horn)
+
+simulation2(data = data, mat = alldg, voom_formula = adj_formula, predictor = "sexmale", miss_mech = "MCAR", prop_miss = 85, pattern = pattern1_mnar, pcs = pcs_horn)
+simulation2(data = data, mat = alldg, voom_formula = adj_formula, predictor = "sexmale", miss_mech = "MAR", prop_miss = 85, pattern = pattern1_mnar, pcs = pcs_horn)
+simulation2(data = data, mat = alldg, voom_formula = adj_formula, predictor = "sexmale", miss_mech = "MNAR", prop_miss = 85, pattern = pattern1_mnar, pcs = pcs_horn)
+time2 <- Sys.time()
+print(time2 - time1)
+```
+
+
+Below reruns the RNAseqCovarImpute MI PCA method only, using 80% variance cutoff to determine the number of PCs to include. Above, when running this method, we used Horn's parallel analysis to determine the number of PCs to include.
+If all files are saved above, you can close out and restart here to free up R environment.
+```{r}
+library(tidyverse)
+library(Amelia)
+library(mice)
+library(edgeR)
+library(doParallel)
+library(foreach)
+library(RNAseqCovarImpute)
+library(doRNG)
+library(BiocParallel)
+data <- readRDS("data_cancer.RDS")
+mat <- readRDS("alldg_cancer.RDS")
+alldg <- readRDS("alldg_cancer.RDS")
+pcs_horn <- readRDS("pcs_cancer.RDS")
+pcs_80 <- readRDS("pcs_cancer_80.RDS")
+truth_res <- read_csv("truth_res_cancer_data_sex_age_smoking.csv")
+
+adj_formula <- "~sex + age + smoking"
+
+# remake the missing patterns if you closed out.
+pattern_vars <- expand.grid(0:1, 0:1)
+# then add back the predictor of interest, which is never amputed, so the first col =1 the whole way down
+pattern2 <- matrix(1, nrow = nrow(pattern_vars), ncol = 1)
+pattern1 <- cbind(pattern2, pattern_vars)
+# remove last row which is all 1s (all 1s means no missingness induced)
+pattern1 <- pattern1[1:nrow(pattern1) - 1, ]
+# for MNAR, variables that will be observed are weighted with 0, such that all the missingness depends on data that are also missing. For MNAR, we can add the data on individual and set it to 0 to indicate that it should be missing.
+pattern3 <- matrix(0, nrow = nrow(pattern1), ncol = 1)
+pattern1_mnar <- cbind(pattern1, pattern3)
+
+simulation3 <- function(data, mat, voom_formula, predictor, miss_mech, prop_miss, pattern, pcs) {
+  RNGkind("L'Ecuyer-CMRG")
+  mcoptions <- list(mc.set.seed = TRUE)
+  myCluster <- makeCluster(10, # number of cores to use
+    type = "PSOCK"
+  ) # type of cluster
+  registerDoParallel(myCluster)
+  set.seed(2023)
+  amputed_data <- foreach(i = 1:10, .options.multicore = mcoptions) %dorng% {
+    library(tidyverse)
+    library(mice)
+    library(edgeR)
+    library(BiocStyle)
+    library(doParallel)
+    library(foreach)
+    library(RNAseqCovarImpute)
+    library(missForest)
+    library(BiocParallel)
+    truth_res <- read_csv("truth_res_cancer_data_sex_age_smoking.csv") 
+    # convenient to save the true results along with the different methods
+    mnar_weights <- cbind(matrix(0, nrow = 3, ncol = 3), matrix(1, nrow = 3))
+    # Simulate missing data using mice ampute function
+    result <- ampute(data = data, prop = prop_miss, mech = miss_mech, patterns = pattern, weights = mnar_weights)
+    ampute_i <- result$amp
+
+    # ampute may convert data to numeric for calculations of weights that influence pattern of missing data for MAR and MNAR mechanisms. But no weights if MCAR
+    if (miss_mech != "MCAR") {
+      ampute_i <- ampute_i %>%
+        mutate(sex = ifelse(sex == 2, "male", "female")) %>%
+        mutate(
+          sex = as.factor(sex),
+          smoking = as.factor(smoking),
+          sampling_site = as.factor(sampling_site)
+        )
+    }
+    # MNAR doesn't get the extra data, but MAR and MCAR do.
+    if (miss_mech != "MNAR") {
+      ampute_i <- ampute_i %>% mutate(sampling_site = data$sampling_site)
+    }
+
+    output <- ampute_i
+  }
+
+  stopCluster(myCluster)
+  # Now that we have 10 datasets with simualted missingness, we loop through and run RNAseqCovarImpute MI PCA
+  myCluster <- makeCluster(5, # number of cores to use
+    type = "PSOCK"
+  ) # type of cluster
+  registerDoParallel(myCluster)
+
+  all_other_methods <- foreach(i = 1:as.numeric(length(amputed_data))) %dopar% {
+    # new PCA MI method
+    library(tidyverse)
+    library(mice)
+    library(edgeR)
+    library(BiocStyle)
+    library(doParallel)
+    library(foreach)
+    library(RNAseqCovarImpute)
+    library(missForest)
+    library(BiocParallel)
+    truth_res <- read_csv("truth_res_cancer_data_sex_age_smoking.csv") # convenient to save the true results along with the different methods
+
+
+    ampute_i <- amputed_data[[i]]
+    # Add the PCA data, number of PCs was determined by Horn's parallel analysis
+    ampute_pca <- cbind(ampute_i, pcs)
+    # Run MI PCA method
+    imp <- mice(ampute_pca, m = 10)
+    mi_pca_res <- limmavoom_imputed_data_pca(imp = imp, DGE = mat, voom_formula = voom_formula, BPPARAM = SerialParam()) %>%
+      arrange(sexmale_p) %>%
+      mutate(combined_p_adj = p.adjust(sexmale_p, method = "fdr")) %>%
+      mutate(significant = ifelse(combined_p_adj < 0.05, "Yes", "No")) %>%
+      dplyr::select(probe, sexmale_coef, significant)
+
+    both_models_pca <- truth_res %>%
+      dplyr::select(-significant) %>%
+      left_join(mi_pca_res)
+    coefs_pca <- mi_pca_res %>% dplyr::select(probe, sexmale_coef)
+
+    # For calculating false postive rate and true positive rate
+    true_number <- both_models_pca %>%
+      dplyr::filter(null == FALSE) %>%
+      nrow() %>%
+      as.numeric()
+    true_identified <- both_models_pca %>%
+      dplyr::filter(null == FALSE) %>%
+      dplyr::filter(significant == "Yes") %>%
+      nrow() %>%
+      as.numeric()
+    false_pos <- both_models_pca %>%
+      dplyr::filter(significant == "Yes") %>%
+      dplyr::filter(null == TRUE) %>%
+      nrow() %>%
+      as.numeric()
+    total_pos <- both_models_pca %>%
+      dplyr::filter(significant == "Yes") %>%
+      nrow() %>%
+      as.numeric()
+
+
+    error_summary_pca <- tibble(
+      prop_true_identifed = true_identified / true_number,
+      false_pos_ratio = false_pos / total_pos
+    ) %>%
+      mutate(Method = "RNAseqCovarImpute PCA")
+
+
+
+    output <- list(
+      coefs = coefs_pca,
+      error_pca = error_summary_pca
+    )
+  }
+
+
+  savename2 <- paste0("./data/MI_PCA_80_", miss_mech, "_", predictor, "_", as.character(prop_miss), "_cancer")
+  saveRDS(all_other_methods, savename2)
+}
+
+
+
+time1 <- Sys.time()
+simulation3(data = data, mat = alldg, voom_formula = adj_formula, predictor = "sexmale", miss_mech = "MCAR", prop_miss = 55, pattern = pattern1_mnar, pcs = pcs_80)
+simulation3(data = data, mat = alldg, voom_formula = adj_formula, predictor = "sexmale", miss_mech = "MAR", prop_miss = 55, pattern = pattern1_mnar, pcs = pcs_80)
+simulation3(data = data, mat = alldg, voom_formula = adj_formula, predictor = "sexmale", miss_mech = "MNAR", prop_miss = 55, pattern = pattern1_mnar, pcs = pcs_80)
+time2 <- Sys.time()
+print(time2 - time1)
+simulation3(data = data, mat = alldg, voom_formula = adj_formula, predictor = "sexmale", miss_mech = "MCAR", prop_miss = 65, pattern = pattern1_mnar, pcs = pcs_80)
+simulation3(data = data, mat = alldg, voom_formula = adj_formula, predictor = "sexmale", miss_mech = "MAR", prop_miss = 65, pattern = pattern1_mnar, pcs = pcs_80)
+simulation3(data = data, mat = alldg, voom_formula = adj_formula, predictor = "sexmale", miss_mech = "MNAR", prop_miss = 65, pattern = pattern1_mnar, pcs = pcs_80)
+
+simulation3(data = data, mat = alldg, voom_formula = adj_formula, predictor = "sexmale", miss_mech = "MCAR", prop_miss = 75, pattern = pattern1_mnar, pcs = pcs_80)
+simulation3(data = data, mat = alldg, voom_formula = adj_formula, predictor = "sexmale", miss_mech = "MAR", prop_miss = 75, pattern = pattern1_mnar, pcs = pcs_80)
+simulation3(data = data, mat = alldg, voom_formula = adj_formula, predictor = "sexmale", miss_mech = "MNAR", prop_miss = 75, pattern = pattern1_mnar, pcs = pcs_80)
+
+simulation3(data = data, mat = alldg, voom_formula = adj_formula, predictor = "sexmale", miss_mech = "MCAR", prop_miss = 85, pattern = pattern1_mnar, pcs = pcs_80)
+simulation3(data = data, mat = alldg, voom_formula = adj_formula, predictor = "sexmale", miss_mech = "MAR", prop_miss = 85, pattern = pattern1_mnar, pcs = pcs_80)
+simulation3(data = data, mat = alldg, voom_formula = adj_formula, predictor = "sexmale", miss_mech = "MNAR", prop_miss = 85, pattern = pattern1_mnar, pcs = pcs_80)
+time2 <- Sys.time()
+print(time2 - time1)
+```
+
