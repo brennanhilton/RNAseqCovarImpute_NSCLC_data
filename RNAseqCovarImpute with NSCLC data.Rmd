@@ -25,7 +25,7 @@ library(BiocParallel)
 ```
 
 Data processing
-Data come from EMBL-EBI: E-GEOD-81089. I renamed the experiment-design.tsv file as "covariates.tsv" and the raw-counts file as "raw-counts.tsv"
+Data come from EMBL-EBI: E-GEOD-81089. I renamed the experiment-design.tsv file as "covariates.tsv"
 ```{r}
 data <- read_tsv("./covariates.tsv") %>% janitor::clean_names()
 colnames(data) <- gsub("^sample_characteristic_", "", colnames(data))
@@ -35,7 +35,7 @@ data <- data %>%
   mutate(age = as.numeric(age)) %>%
   dplyr::rename(smoking = clinical_information)
 
-counts <- read_tsv("./raw-counts.tsv") %>%
+counts <- read_tsv("./E-GEOD-81089-raw-counts.tsv") %>%
   dplyr::rename(
     "ENSEMBL" = "Gene ID",
     "SYMBOL" = "Gene Name"
