@@ -12,8 +12,9 @@ Institute [EMBL-EBI:
 E-GEOD-81089](https://www.ebi.ac.uk/gxa/experiments/E-GEOD-81089/Downloads).
 If you download this repo from GitHub and want to run the code, you will
 need to download the counts indicated on the EMBL-EBI page indicated as
-“All raw counts for the experiment.” I renamed the experiment-design.tsv
-file as “covariates.tsv”.
+“All raw counts for the experiment.” I included the covariates in the
+repo, the experiment-design.tsv file, also downloaded from that EMBL-EBI
+page.
 
 First run the “RNAseqCovarImpute with NSCLC data.Rmd” file. It includes
 code for differential expression analysis using the full data,
@@ -22,11 +23,13 @@ then conducting differential expression analysis using the complete
 case, single imputation, and RNAseqCovarImpute methods to handle missing
 data. We additionally compare three different versions of
 RNAseqCovarImpute, the MI Gene Bin, MI PCA 80%, and MI PCA Horn methods.
+Intermediate data files are included in the data folder if you want to
+skip this step.
 
 Then run the “RNAseqCovarImpute with NSCLC data plot.Rmd” file. It
-includes code for plotting the results in terms of true positive rate
-(TPR), false positive rate (FPR), and mean absolute percentage error
-(MAPE).
+includes code for plotting the results (stored in the data folder) in
+terms of true positive rate (TPR), false positive rate (FPR), and mean
+absolute percentage error (MAPE).
 
 [The RNAseqCovarImpute package is available on
 Bioconductor](https://bioconductor.org/packages/release/bioc/html/RNAseqCovarImpute.html)

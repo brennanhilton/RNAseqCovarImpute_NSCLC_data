@@ -25,16 +25,18 @@ library(BiocParallel)
 ```
 
 Data processing
-Data come from EMBL-EBI: E-GEOD-81089. I renamed the experiment-design.tsv file as "covariates.tsv"
+Data come from EMBL-EBI: E-GEOD-81089.
 ```{r}
-data <- read_tsv("./covariates.tsv") %>% janitor::clean_names()
+data <- read_tsv("./E-GEOD-81089-experiment-design.tsv") %>% janitor::clean_names()
 colnames(data) <- gsub("^sample_characteristic_", "", colnames(data))
+# Select the covariates we want
 data <- data %>% dplyr::select(run, sex, age, clinical_information, sampling_site)
+# Make age numeric instead of "60 year", "70 year", etc.
 data$age <- gsub(" year", "", data$age)
 data <- data %>%
   mutate(age = as.numeric(age)) %>%
   dplyr::rename(smoking = clinical_information)
-
+# Load the counts
 counts <- read_tsv("./E-GEOD-81089-raw-counts.tsv") %>%
   dplyr::rename(
     "ENSEMBL" = "Gene ID",
@@ -51,11 +53,11 @@ ncol(counts)
 data %>%
   mutate(hmm = colnames(counts) == run) %>%
   filter(run == FALSE)
-
+#Change chatacters to factors
 data <- data %>% mutate(sex = as.factor(sex), smoking = as.factor(smoking), sampling_site = as.factor(sampling_site))
 summary(data)
 
-# Store counts in DGE list
+# Store counts in DGE list, the R class used in limma-voom analysis
 alldg <- DGEList(counts, genes = annot)
 
 # Calculate the minimum library size in millions
@@ -65,26 +67,27 @@ cpm_cutoff <- 10 / min_lib_size
 # Filter to keep genes with an average CPM across all samples above this cutoff
 keep <- rowMeans(cpm(alldg)) > cpm_cutoff
 alldg <- alldg[keep, , keep.lib.sizes = FALSE]
-nrow(alldg)
+dim(alldg)
 # norm factors used by voom to normalize library sizes using TMM method
 alldg <- calcNormFactors(alldg)
-dim(alldg)
+
 
 data <- data %>% dplyr::select(-run)
 ```
 
 Get true positives from the full data model
 ```{r}
+# Multivariate model examines effects of sex, age, and smoking status on gene expression
 design <- model.matrix(~ sex + age + smoking, data)
-
+# Limma-voom analysis
 vout <- limma::voom(alldg, design = design)
 lout <- limma::lmFit(vout)
 coefhat <- coef(lout)[, -1, drop = FALSE]
 eout <- eBayes(lout)
-
+# Get the significant DEGs for male versus female sex
 top.table1 <- topTable(eout, coef = "sexmale", sort.by = "P", n = Inf) %>%
   mutate(significant = ifelse(adj.P.Val < 0.05, "Yes", "No"))
-
+# truth_res stores the 'true DEGs' from the full data model
 truth_res <- tibble(
   ENSEMBL = top.table1$ENSEMBL,
   coef_verify = top.table1$logFC,
@@ -100,11 +103,11 @@ truth_res %>%
   summarize(n = n())
 ```
 
-Set up missing patterns
+Set up missing patterns. Example
 ```{r}
 adj_formula <- "~sex + age + smoking"
 
-# setup missing data patterns
+# setup missing data patterns. See mice::ampute for more details on the missing patterns and weights
 pattern_vars <- expand.grid(0:1, 0:1)
 # then add back the predictor of interest, which is never amputed, so the first col =1 the whole way down
 pattern2 <- matrix(1, nrow = nrow(pattern_vars), ncol = 1)
@@ -135,13 +138,13 @@ check %>%
 Run PCA for RNAseqCovarImpute
 ```{r}
 library(PCAtools)
-# for PCAtools variables are expected to be in the rows and samples in the columns by default.
+# For PCAtools variables are expected to be in the rows and samples in the columns by default.
 pca_data <- vout$E
-
-horn <- parallelPCA(pca_data)
-
+# Run PCA
 p <- pca(pca_data)
-
+# Horn's parallel analysis determines the number of PCs to retain
+# Retains PCs that explain more variation than PCs from random data
+horn <- parallelPCA(pca_data)
 horn$n
 # For horn we extract 56 PCs
 pcs <- p$rotated[, 1:horn$n]
@@ -157,6 +160,7 @@ saveRDS(pcs, "pcs_cancer_80.RDS")
 ```
 
 Simulation study below. If all files are saved above, you can close out and restart here to free up R environment.
+Make sure to set the proper number of cores according to your own environment.
 ```{r}
 library(tidyverse)
 library(Amelia)
@@ -189,12 +193,13 @@ pattern1_mnar <- cbind(pattern1, pattern3)
 
 # This function will simulate missingness given a missing mechanism and percent missing, and then run CC, SI, and RNAseqCovarImpute methods
 simulation2 <- function(data, mat, voom_formula, predictor, miss_mech, prop_miss, pattern, pcs) {
-  RNGkind("L'Ecuyer-CMRG")
+  RNGkind("L'Ecuyer-CMRG") # in dorng this RNGkind ensures the different RNG streams are statistically independent. We want 10 different datasets with simulated missingness
   mcoptions <- list(mc.set.seed = TRUE)
-  myCluster <- makeCluster(10, # number of cores to use
+  myCluster <- makeCluster(10, # number of cores to use, can use detectCores() to see how many available to you
     type = "PSOCK"
   ) # type of cluster
   registerDoParallel(myCluster)
+  # With dorng, calling set.seed before the loop ensures reproducibility of the results
   set.seed(2023)
   all_coef_se <- foreach(i = 1:10, .options.multicore = mcoptions) %dorng% {
     library(tidyverse)
@@ -535,7 +540,7 @@ print(time2 - time1)
 
 
 Below reruns the RNAseqCovarImpute MI PCA method only, using 80% variance cutoff to determine the number of PCs to include. Above, when running this method, we used Horn's parallel analysis to determine the number of PCs to include.
-If all files are saved above, you can close out and restart here to free up R environment.
+If all files are saved above, you should close out and restart here to free up R environment.
 ```{r}
 library(tidyverse)
 library(Amelia)

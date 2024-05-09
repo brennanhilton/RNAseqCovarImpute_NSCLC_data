@@ -61,8 +61,9 @@ final_data_cancer <- data_cancer %>%
     Method == "RNAseqCovarImpute" ~ "MI Gene Bin"
   ))
 
-
+# One plot will compare the various MI methods
 data_mi_cancer <- final_data_cancer %>% filter(Method %in% c("MI Gene Bin", "MI PCA 80%", "MI PCA Horn"))
+# One plot will compare the best MI method with CC and SI
 data_main_cancer <- final_data_cancer %>%
   filter(Method %in% c("SI", "CC", "MI PCA Horn")) %>%
   mutate(Method = ifelse(Method == "MI PCA Horn", "RNAseqCovarImpute", Method)) %>%
@@ -220,8 +221,9 @@ cancer_mape <- cancer_mape %>%
   ))
 
 
-
+# One plot will compare the various MI methods
 mape_mi_cancer <- cancer_mape %>% filter(Method %in% c("MI Gene Bin", "MI PCA 80%", "MI PCA Horn"))
+# One plot will compare the best MI method with CC and SI
 mape_main_cancer <- cancer_mape %>%
   filter(Method %in% c("SI", "CC", "MI PCA Horn")) %>%
   mutate(Method = ifelse(Method == "MI PCA Horn", "RNAseqCovarImpute", Method)) %>%
