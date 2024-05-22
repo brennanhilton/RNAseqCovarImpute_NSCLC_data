@@ -14,6 +14,7 @@ install_github("brennanhilton/RNAseqCovarImpute")
 
 ```{r}
 library(tidyverse)
+library(janitor)
 library(Amelia)
 library(mice)
 library(edgeR)
