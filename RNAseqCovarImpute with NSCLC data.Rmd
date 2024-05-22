@@ -688,6 +688,8 @@ simulation3 <- function(data, mat, voom_formula, predictor, miss_mech, prop_miss
   }
 
 
+  stopCluster(myCluster)
+  rm(myCluster)
   savename2 <- paste0("./data/MI_PCA_80_", miss_mech, "_", predictor, "_", as.character(prop_miss), "_cancer")
   saveRDS(all_other_methods, savename2)
 }
