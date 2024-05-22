@@ -202,15 +202,15 @@ simulation2 <- function(data, mat, voom_formula, predictor, miss_mech, prop_miss
   # With dorng, calling set.seed before the loop ensures reproducibility of the results
   set.seed(2023)
   all_coef_se <- foreach(i = 1:10, .options.multicore = mcoptions) %dorng% {
-    library(tidyverse)
-    library(mice)
-    library(edgeR)
-    library(BiocStyle)
-    library(doParallel)
-    library(foreach)
-    library(RNAseqCovarImpute)
-    library(missForest)
-    library(BiocParallel)
+    require(tidyverse)
+    require(mice)
+    require(edgeR)
+    require(BiocStyle)
+    require(doParallel)
+    require(foreach)
+    require(RNAseqCovarImpute)
+    require(missForest)
+    require(BiocParallel)
     truth_res <- read_csv("truth_res_cancer_data_sex_age_smoking.csv") 
     # convenient to save the true results along with the different methods
     mnar_weights <- cbind(matrix(0, nrow = 3, ncol = 3), matrix(1, nrow = 3))
@@ -324,6 +324,8 @@ simulation2 <- function(data, mat, voom_formula, predictor, miss_mech, prop_miss
   saveRDS(res_bin_method, savename1)
 
   # Separate parallel loop for all other methods together
+  stopCluster(myCluster)
+  rm(myCluster)
   myCluster <- makeCluster(5, # number of cores to use
     type = "PSOCK"
   ) # type of cluster
@@ -331,15 +333,15 @@ simulation2 <- function(data, mat, voom_formula, predictor, miss_mech, prop_miss
 
   all_other_methods <- foreach(i = 1:as.numeric(length(rubins_res))) %dopar% {
     # new PCA MI method
-    library(tidyverse)
-    library(mice)
-    library(edgeR)
-    library(BiocStyle)
-    library(doParallel)
-    library(foreach)
-    library(RNAseqCovarImpute)
-    library(missForest)
-    library(BiocParallel)
+    require(tidyverse)
+    require(mice)
+    require(edgeR)
+    require(BiocStyle)
+    require(doParallel)
+    require(foreach)
+    require(RNAseqCovarImpute)
+    require(missForest)
+    require(BiocParallel)
     truth_res <- read_csv("truth_res_cancer_data_sex_age_smoking.csv") 
     # convenient to save the true results along with the different methods
 
@@ -507,10 +509,8 @@ simulation2 <- function(data, mat, voom_formula, predictor, miss_mech, prop_miss
     )
   }
 
-
-
-
-
+  stopCluster(myCluster)
+  rm(myCluster)
   savename2 <- paste0("./data/all_other_methods_", miss_mech, "_", predictor, "_", as.character(prop_miss), "_cancer")
   saveRDS(all_other_methods, savename2)
 }
@@ -615,6 +615,7 @@ simulation3 <- function(data, mat, voom_formula, predictor, miss_mech, prop_miss
   }
 
   stopCluster(myCluster)
+  rm(myCluster)
   # Now that we have 10 datasets with simualted missingness, we loop through and run RNAseqCovarImpute MI PCA
   myCluster <- makeCluster(5, # number of cores to use
     type = "PSOCK"
@@ -623,15 +624,15 @@ simulation3 <- function(data, mat, voom_formula, predictor, miss_mech, prop_miss
 
   all_other_methods <- foreach(i = 1:as.numeric(length(amputed_data))) %dopar% {
     # new PCA MI method
-    library(tidyverse)
-    library(mice)
-    library(edgeR)
-    library(BiocStyle)
-    library(doParallel)
-    library(foreach)
-    library(RNAseqCovarImpute)
-    library(missForest)
-    library(BiocParallel)
+    require(tidyverse)
+    require(mice)
+    require(edgeR)
+    require(BiocStyle)
+    require(doParallel)
+    require(foreach)
+    require(RNAseqCovarImpute)
+    require(missForest)
+    require(BiocParallel)
     truth_res <- read_csv("truth_res_cancer_data_sex_age_smoking.csv") # convenient to save the true results along with the different methods
 
 
