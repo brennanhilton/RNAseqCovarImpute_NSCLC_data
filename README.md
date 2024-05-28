@@ -16,7 +16,7 @@ need to download the counts indicated on the EMBL-EBI page indicated as
 repo, the experiment-design.tsv file, also downloaded from that EMBL-EBI
 page.
 
-First run the “RNAseqCovarImpute with NSCLC data.Rmd” file. It includes
+First run the “RNAseqCovarImpute_with_NSCLC_data.Rmd” file. It includes
 code for differential expression analysis using the full data,
 simulating missing data points under MCAR, MAR, and MNAR mechanisms, and
 then conducting differential expression analysis using the complete
@@ -26,7 +26,7 @@ RNAseqCovarImpute, the MI Gene Bin, MI PCA 80%, and MI PCA Horn methods.
 Intermediate data files are included in the data folder if you want to
 skip this step.
 
-Then run the “RNAseqCovarImpute with NSCLC data plot.Rmd” file. It
+Then run the “RNAseqCovarImpute_with_NSCLC_data plot.Rmd” file. It
 includes code for plotting the results (stored in the data folder) in
 terms of true positive rate (TPR), false positive rate (FPR), and mean
 absolute percentage error (MAPE).
